@@ -3,6 +3,7 @@ extern crate core;
 use std::cmp::max;
 use std::convert::TryInto;
 use std::ops::Shl;
+use thiserror::Error;
 
 // const P_16: u16 = 0xb7e1;
 // const P_64: u64 = 0xb7e151628aed2a6b;
@@ -50,7 +51,7 @@ impl RC5_32 {
         }
 
         L.iter().enumerate().for_each(|(i, l)| {
-            log::debug!("L[{}] = {:#08x}", i, l);
+            log::trace!("L[{}] = {:#08x}", i, l);
         });
 
         // I chose to declare S as a mutable vector instead of mapping\folding,
@@ -62,7 +63,7 @@ impl RC5_32 {
         }
 
         S.iter().enumerate().for_each(|(i, s)| {
-            log::debug!("S[{}] = {:#08x}", i, s);
+            log::trace!("S[{}] = {:#08x}", i, s);
         });
 
         let (mut A, mut B, mut i, mut j, mut k) = (0, 0, 0, 0, 0);
@@ -74,8 +75,8 @@ impl RC5_32 {
             L[j] = L[j].wrapping_add(A).wrapping_add(B).rotate_left(rotation);
             B = L[j];
 
-            log::debug!("S[{}] = {:#08x}", i, A);
-            log::debug!("L[{}] = {:#08x}", j, B);
+            log::trace!("S[{}] = {:#08x}", i, A);
+            log::trace!("L[{}] = {:#08x}", j, B);
 
             i = (i + 1) % t;
             j = (j + 1) % c;
@@ -92,20 +93,29 @@ impl RC5_32 {
     }
 
     /// This function should return a cipher text for a given key and plaintext
-    pub fn encode(&self, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
-        if plaintext.len() / Self::U != 2 {
+    pub fn encode(&self, plaintext: &[u8]) -> Result<Vec<u8>, RC5Error> {
+        if plaintext.len() != 2 * Self::U {
             // This condition can be relaxed, as following:
             // say the length of the plaintext is `n`,
             // create a service message = (length of plaintext) + plaintext + padding
             // such that the length of the service message is divisible by 2 * Self::U.
             // Split the service message into blocks of length 2 * Self::U and invoke
             // this encode function on each of them, then concatenate.
-            anyhow::bail!("Plaintext length must be as long as 2 * {}", Self::U);
+            return Err(RC5Error::IncorrectBlockSize {
+                actual: plaintext.len(),
+                expected: 2 * Self::U,
+            });
         }
 
         let (pt_0, pt_1) = plaintext.split_at(Self::U);
-        let pt_0 = u32::from_le_bytes(pt_0.try_into()?);
-        let pt_1 = u32::from_le_bytes(pt_1.try_into()?);
+        let pt_0 = u32::from_le_bytes(
+            pt_0.try_into()
+                .map_err(|err| RC5Error::InternalError(format!("{err:?}")))?,
+        );
+        let pt_1 = u32::from_le_bytes(
+            pt_1.try_into()
+                .map_err(|err| RC5Error::InternalError(format!("{err:?}")))?,
+        );
 
         let (A, B) = (1..=self.r).fold(
             (self.S[0].wrapping_add(pt_0), self.S[1].wrapping_add(pt_1)),
@@ -120,8 +130,8 @@ impl RC5_32 {
                     .rotate_left(rotation)
                     .wrapping_add(self.S[2 * round + 1]);
 
-                log::debug!("A = {:#08x}", A);
-                log::debug!("B = {:#08x}", B);
+                log::trace!("A = {:#08x}", A);
+                log::trace!("B = {:#08x}", B);
                 (A, B)
             },
         );
@@ -134,14 +144,23 @@ impl RC5_32 {
     }
 
     /// This function should return a cipher text for a given key and plaintext
-    pub fn decode(&self, ciphertext: &[u8]) -> anyhow::Result<Vec<u8>> {
-        if ciphertext.len() / Self::U != 2 {
-            anyhow::bail!("Ciphertext length must be as long as 2 * {}", Self::U);
+    pub fn decode(&self, ciphertext: &[u8]) -> Result<Vec<u8>, RC5Error> {
+        if ciphertext.len() != 2 * Self::U {
+            return Err(RC5Error::IncorrectBlockSize {
+                actual: ciphertext.len(),
+                expected: 2 * Self::U,
+            });
         }
 
         let (ct_0, ct_1) = ciphertext.split_at(Self::U);
-        let ct_0 = u32::from_le_bytes(ct_0.try_into()?);
-        let ct_1 = u32::from_le_bytes(ct_1.try_into()?);
+        let ct_0 = u32::from_le_bytes(
+            ct_0.try_into()
+                .map_err(|err| RC5Error::InternalError(format!("{err:?}")))?,
+        );
+        let ct_1 = u32::from_le_bytes(
+            ct_1.try_into()
+                .map_err(|err| RC5Error::InternalError(format!("{err:?}")))?,
+        );
 
         let (A, B) = (1..=self.r)
             .rev()
@@ -152,8 +171,8 @@ impl RC5_32 {
                 let rotation = B % Self::W;
                 A = A.wrapping_sub(self.S[2 * round]).rotate_right(rotation) ^ B;
 
-                log::debug!("A = {:#08x}", A);
-                log::debug!("B = {:#08x}", B);
+                log::trace!("A = {:#08x}", A);
+                log::trace!("B = {:#08x}", B);
 
                 (A, B)
             });
@@ -168,6 +187,15 @@ impl RC5_32 {
                 .collect(),
         )
     }
+}
+
+#[derive(Error, Debug)]
+pub enum RC5Error {
+    #[error("Incorrect block size: actual = {actual}, expected = {expected}")]
+    IncorrectBlockSize { expected: usize, actual: usize },
+
+    #[error("Internal error: {0}")]
+    InternalError(String),
 }
 
 #[cfg(test)]
@@ -248,6 +276,27 @@ mod tests {
         let res = rc5.decode(&ct)?;
 
         assert_eq!(&pt[..], &res[..]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn fail_encode() -> anyhow::Result<()> {
+        let _ = pretty_env_logger::try_init();
+
+        let key = vec![
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0x0F,
+        ];
+
+        let rc5 = RC5_32::new(12, &key);
+
+        let pt = vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+
+        assert!(matches!(
+            rc5.encode(&pt),
+            Err(RC5Error::IncorrectBlockSize { .. })
+        ));
 
         Ok(())
     }
